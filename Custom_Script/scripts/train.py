@@ -10,10 +10,17 @@ import datetime
 import joblib
 
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import GradientBoostingClassifier
 
 from timeseries_utilities import ColumnDropper, SimpleLagger, SimpleCalendarFeaturizer, SimpleForecaster
 from utilities import set_telemetry_scenario
+
+from azureml.core import Environment, ScriptRunConfig, Experiment
+from azureml.core.conda_dependencies import CondaDependencies
+from azureml.train.hyperdrive import GridParameterSampling, HyperDriveConfig, PrimaryMetricGoal, choice
+
+from inspect import getsourcefile
+from os.path import abspath
 
 # 0.0 Parse input arguments
 parser = argparse.ArgumentParser("split")
@@ -45,6 +52,80 @@ def set_telemetry(run):
     except Exception:
         pass
 
+def get_best_hyperparameters(file_name):
+    # does the hyper parameters optimization
+    # Create a Python environment for the experiment
+    trial_env = Environment(name="many_models_environment")
+    trial_conda_deps = CondaDependencies.create(pip_packages=['sklearn', 'pandas', 'joblib', 'azureml-defaults', 'azureml-core'])
+    trial_env.python.conda_dependencies = trial_conda_deps
+
+    # Get the training dataset
+    dataset_name = 'oj_data_small_train'
+    ws = current_run.experiment.workspace
+    dataset = ws.datasets.get(dataset_name)
+
+    # Create a script config
+    cpu_cluster_name = "cpucluster5"
+    
+    current_script_path = abspath(getsourcefile(lambda:0))
+    current_script_dir = current_script_path[:current_script_path.rindex("/")]
+   
+    script_config = ScriptRunConfig(source_directory=current_script_dir,
+                                    script='trial.py',
+                                    # Add non-hyperparameter arguments -in this case, the training dataset
+                                    arguments = ['--input-data', dataset.as_named_input('training_data').as_mount(),
+                                                 '--file_name', f'{file_name}.csv',
+                                                 '--target_column', 'Quantity', 
+                                                 '--timestamp_column', 'WeekStarting', 
+                                                 '--timeseries_id_columns', 'Store', 'Brand',
+                                                 '--drop_columns', 'Revenue', 'Store', 'Brand',
+                                                 '--model_type', 'gb',
+                                                 '--test_size', 20],
+                                    environment=trial_env,
+                                    compute_target = cpu_cluster_name)
+
+    # Sample a range of parameter values
+    params = GridParameterSampling(
+        {
+            # Hyperdrive will try 6 combinations, adding these as script arguments
+            '--learning_rate': choice(0.01, 0.1, 1.0),
+            '--n_estimators' : choice(10, 100)
+        }
+    )
+
+    # Configure hyperdrive settings
+    hyperdrive = HyperDriveConfig(run_config=script_config, 
+                            hyperparameter_sampling=params, 
+                            policy=None, # No early stopping policy
+                            primary_metric_name='mae', # Find the lowest mae metric
+                            primary_metric_goal=PrimaryMetricGoal.MINIMIZE, 
+                            max_total_runs=6, # Restict the experiment to 6 iterations
+                            max_duration_minutes=10, # Restrict execution to 10 minutes
+                            max_concurrent_runs=2) # Run up to 2 iterations in parallel
+
+    # Run the experiment
+    experiment_name = f'trial_{file_name}'.replace('.', '_')
+    experiment = Experiment(workspace=ws, name=experiment_name)
+    run = experiment.submit(config=hyperdrive)
+
+    # Show the status in the notebook as the experiment runs
+    run.wait_for_completion()
+
+    # Print all child runs, sorted by the primary metric
+    for child_run in run.get_children_sorted_by_primary_metric():
+        print(child_run)
+
+    # Get the best run, and its metrics and arguments
+    best_run = run.get_best_run_by_primary_metric()
+    best_run_metrics = best_run.get_metrics()
+    script_arguments = best_run.get_details() ['runDefinition']['arguments']
+
+    # get best trial hyperparameters values
+    learning_rate = script_arguments[script_arguments.index('--learning_rate')+1]
+    n_estimators = script_arguments[script_arguments.index('--n_estimators')+1]
+
+    return float(learning_rate), int(n_estimators)
+
 
 def run(input_data):
     # 1.0 Set up output directory and the results list
@@ -70,105 +151,89 @@ def run(input_data):
         test = data[-args.test_size:]
 
         child_run = None
-        try:
-            child_run = current_run.child_run(name=model_name)
 
-            # Do not remove the following code
-            set_telemetry(child_run)
+        # try:
 
-            # 3.0 Create and fit the forecasting pipeline
-            # The pipeline will drop unhelpful features, make a calendar feature, and make lag features
-            lagger = SimpleLagger(args.target_column, lag_orders=[1, 2, 3, 4])
-            transform_steps = [('column_dropper', ColumnDropper(args.drop_columns)),
-                               ('calendar_featurizer', SimpleCalendarFeaturizer()), ('lagger', lagger)]
-            forecaster = SimpleForecaster(transform_steps, LinearRegression(), args.target_column,
-                                          args.timestamp_column)
-            forecaster.fit(train)
-            print('Featurized data example:')
-            print(forecaster.transform(train).head())
+        child_run = current_run.child_run(name=model_name)
 
-            # 4.0 Get predictions on test set
-            forecasts = forecaster.forecast(test)
-            compare_data = test.assign(forecasts=forecasts).dropna()
+        # Do not remove the following code
+        set_telemetry(child_run)
 
-            # 5.0 Calculate accuracy metrics for the fit
-            mse = mean_squared_error(compare_data[args.target_column], compare_data['forecasts'])
-            rmse = np.sqrt(mse)
-            mae = mean_absolute_error(compare_data[args.target_column], compare_data['forecasts'])
-            actuals = compare_data[args.target_column].values
-            preds = compare_data['forecasts'].values
-            mape = np.mean(np.abs((actuals - preds) / actuals) * 100)
+        # learning_rate, n_estimators = float('0.1'), int('100')
+        learning_rate, n_estimators = get_best_hyperparameters(file_name)
 
-            # 6.0 Log metrics
-            child_run.log(model_name + '_mse', mse)
-            child_run.log(model_name + '_rmse', rmse)
-            child_run.log(model_name + '_mae', mae)
-            child_run.log(model_name + '_mape', mape)
+        # 3.0 Create and fit the forecasting pipeline
+        # The pipeline will drop unhelpful features, make a calendar feature, and make lag features
+        lagger = SimpleLagger(args.target_column, lag_orders=[1, 2, 3, 4])
+        transform_steps = [('column_dropper', ColumnDropper(args.drop_columns)),
+                            ('calendar_featurizer', SimpleCalendarFeaturizer()), ('lagger', lagger)]
+        forecaster = SimpleForecaster(transform_steps, GradientBoostingClassifier(learning_rate=learning_rate, n_estimators=n_estimators), 
+                                        args.target_column, args.timestamp_column)
+        
+        forecaster.fit(train)
+        print('Featurized data example:')
+        print(forecaster.transform(train).head())
 
-            # 7.0 Train model with full dataset
-            forecaster.fit(data)
+        # 4.0 Get predictions on test set
+        forecasts = forecaster.forecast(test)
+        compare_data = test.assign(forecasts=forecasts).dropna()
 
-            # Simulating the 3 minutes run to test concurrency
-            import time
-            time.sleep(180)
+        # 5.0 Calculate accuracy metrics for the fit
+        mse = mean_squared_error(compare_data[args.target_column], compare_data['forecasts'])
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(compare_data[args.target_column], compare_data['forecasts'])
+        actuals = compare_data[args.target_column].values
+        preds = compare_data['forecasts'].values
+        mape = np.mean(np.abs((actuals - preds) / actuals) * 100)
 
-            # 8.0 Save the forecasting pipeline
-            joblib.dump(forecaster, filename=os.path.join('./outputs/', model_name))
+        # 6.0 Log metrics
+        child_run.log(model_name + '_mse', mse)
+        child_run.log(model_name + '_rmse', rmse)
+        child_run.log(model_name + '_mae', mae)
+        child_run.log(model_name + '_mape', mape)
 
-            # 9.0 Register the model to the workspace
-            # Uses the values in the timeseries id columns from the first row of data to form tags for the model
-            child_run.upload_file(model_name, os.path.join('./outputs/', model_name))
-            ts_id_dict = {id_col: str(data[id_col].iloc[0]) for id_col in args.timeseries_id_columns}
-            tags_dict = {**ts_id_dict, 'ModelType': args.model_type}
-            tags_dict.update({'InputData': os.path.basename(csv_file_path)})
-            tags_dict.update({'StepRunId': current_run.id})
-            tags_dict.update({'RunId': current_run.parent.id})
-            child_run.register_model(model_path=model_name, model_name=model_name,
-                                     model_framework=args.model_type, tags=tags_dict)
+        # 7.0 Train model with full dataset
+        forecaster.fit(data)
 
-            child_run.complete()
-            # 10.0 Add data to output
-            end_datetime = datetime.datetime.now()
-            result.update(ts_id_dict)
-            result['model_type'] = args.model_type
-            result['file_name'] = file_name
-            result['model_name'] = model_name
-            result['start_date'] = str(start_datetime)
-            result['end_date'] = str(end_datetime)
-            result['duration'] = str(end_datetime-start_datetime)
-            result['mse'] = mse
-            result['rmse'] = rmse
-            result['mae'] = mae
-            result['mape'] = mape
-            result['index'] = idx
-            result['num_models'] = len(input_data)
-            result['status'] = child_run.get_status()
-            result['run_id'] = str(child_run.id)
+        # Simulating the 10 sec run to test concurrency
+        import time
+        time.sleep(10)
 
-            print('ending (' + csv_file_path + ') ' + str(end_datetime))
-            result_list.append(result)
-        except Exception:
-            if child_run and child_run.get_status() != 'Completed':
-                child_run.fail()
-            result['model_type'] = args.model_type
-            end_datetime = datetime.datetime.now()
-            result['file_name'] = file_name
-            result['model_name'] = model_name
-            result['start_date'] = str(start_datetime)
-            result['end_date'] = str(end_datetime)
-            result['duration'] = str(end_datetime-start_datetime)
-            result['mse'] = str(None)
-            result['rmse'] = str(None)
-            result['mae'] = str(None)
-            result['mape'] = str(None)
-            result['index'] = idx
-            result['num_models'] = len(input_data)
-            if child_run:
-                result['status'] = child_run.get_status()
-                result['run_id'] = str(child_run.id)
-            else:
-                result['status'] = 'Failed'
-                result['run_id'] = str(None)
+        # 8.0 Save the forecasting pipeline
+        joblib.dump(forecaster, filename=os.path.join('./outputs/', model_name))
+
+        # 9.0 Register the model to the workspace
+        # Uses the values in the timeseries id columns from the first row of data to form tags for the model
+        child_run.upload_file(model_name, os.path.join('./outputs/', model_name))
+        ts_id_dict = {id_col: str(data[id_col].iloc[0]) for id_col in args.timeseries_id_columns}
+        tags_dict = {**ts_id_dict, 'ModelType': args.model_type}
+        tags_dict.update({'InputData': os.path.basename(csv_file_path)})
+        tags_dict.update({'StepRunId': current_run.id})
+        tags_dict.update({'RunId': current_run.parent.id})
+        child_run.register_model(model_path=model_name, model_name=model_name,
+                                    model_framework=args.model_type, tags=tags_dict)
+
+        child_run.complete()
+        # 10.0 Add data to output
+        end_datetime = datetime.datetime.now()
+        result.update(ts_id_dict)
+        result['model_type'] = args.model_type
+        result['file_name'] = file_name
+        result['model_name'] = model_name
+        result['start_date'] = str(start_datetime)
+        result['end_date'] = str(end_datetime)
+        result['duration'] = str(end_datetime-start_datetime)
+        result['mse'] = mse
+        result['rmse'] = rmse
+        result['mae'] = mae
+        result['mape'] = mape
+        result['index'] = idx
+        result['num_models'] = len(input_data)
+        result['status'] = child_run.get_status()
+        result['run_id'] = str(child_run.id)
+
+        print('ending (' + csv_file_path + ') ' + str(end_datetime))
+        result_list.append(result)
 
     # Data returned by this function will be available in parallel_run_step.txt
     return pd.DataFrame(result_list)
